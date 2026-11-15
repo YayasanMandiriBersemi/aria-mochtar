@@ -39,3 +39,5 @@ logs/
 *.bak
 # Python package metadata
 *.egg-info/
+# Python package metadata
+*.egg-info/
