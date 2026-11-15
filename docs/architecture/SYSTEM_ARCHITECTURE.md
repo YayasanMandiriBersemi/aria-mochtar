@@ -89,16 +89,22 @@ All external integrations are strictly outbound (or verified webhook ingress) an
 5. **Canva Connect API / MCP (`INT-004`):** OAuth2-authenticated REST/MCP calls in Stage 3.
 6. **MetaTrader 5 Read-Only Bridge (`INT-006`):** Authenticated read-only REST/gRPC bridge to the MT5 terminal in Stage 3.
 
-### 1.6 End-to-End Data Flow
+### 1.6 End-to-End Data Flow & Canonical Tool Call Sequence
 
-1. **Ingress & Authentication:** User sends a command via CLI or Telegram -> Ingress Adapter verifies owner identity (`SEC-002`) and generates a `trace_id`.
-2. **Context Assembly:** `Aira Core Engine` requests `Context Manager` to load recent session history, relevant tasks/notes, and user preferences from `Persistent Memory`.
-3. **Reasoning & Tool Planning:** `Aira Core Engine` sends the assembled prompt and authorized tool schemas to `AI Reasoning Provider` (Gemini API).
-4. **Policy Evaluation:** If the model proposes a tool call, `Permission Engine` evaluates the tool's risk tier (`PERM-001`):
-   - *Tier A / Tier B:* Approved immediately; routed to `Integration Manager`.
-   - *Tier C:* Halted; `Permission Engine` creates a `PendingApproval` state record and asks `Notification Service` to send an interactive approval request to the owner.
-   - *Tier D:* Blocked immediately with a `PolicyViolationError`.
-5. **Synthesis & Persistence:** Tool outputs (sanitized of secrets and wrapped if untrusted) are returned to `Aira Core Engine` for final synthesis -> Conversation turn and state changes are committed to `Persistent Memory` -> Redacted telemetry is written to `Audit Logger` -> Response is delivered via `Notification Service`.
+1. **Ingress & Authentication:** User sends a command via CLI or Telegram -> Ingress Adapter (`CMP-02`) verifies owner identity and enforces `chat.type == "private"` (`SEC-002`), assigns a unique UUIDv4 `trace_id`, and dispatches an immediate typing indicator.
+2. **Context Assembly:** `Aira Core Engine` (`CMP-03`) requests `Context Manager` (`CMP-04`) to assemble system persona, real-time clock, user preferences, recent turns, and keyword-retrieved notes/tasks from `Persistent Memory` (`CMP-06`) within the token budget.
+3. **Reasoning & Tool Proposal:** `Aira Core Engine` sends the assembled context payload to `AI Reasoning Provider` (`CMP-05`, Google Gemini API), which returns an `LLMResponse` proposing a tool call (`tool_name`, `arguments`).
+4. **Canonical Policy Enforcement & Execution Flow (`ISS-03`):**
+   All tool execution strictly follows the single canonical sequence:
+   $$\text{Aira Core Engine} \longrightarrow \text{Permission Engine} \longrightarrow \text{Tool Adapter} \longrightarrow \text{External Execution} \longrightarrow \text{Audit Logger}$$
+   - **Step 4a (Permission Evaluation):** `Aira Core Engine` submits the proposed tool call to `Permission Engine` (`CMP-08`).
+   - **Step 4b (Policy Decision):**
+     - *Tier A / Tier B (Autonomous):* `Permission Engine` verifies the tool tier under Sink-Aware Taint rules (`ISS-05`) and issues an unforgeable, single-use `PolicyClearance` token.
+     - *Tier C (Consequential HITL):* Execution halts. `Permission Engine` calculates `SHA256(canonical_json(tool, args))`, stores a pending approval record with TTL, and dispatches an approval challenge via `Notification Service` (`CMP-10`) to the owner's Telegram/CLI.
+     - *Tier D (Prohibited):* Execution is blocked immediately with a `PolicyViolationError` and a security alert is emitted.
+   - **Step 4c (Tool Execution):** The `Tool Adapter` (`CMP-07`) verifies the `PolicyClearance` token, executes the deterministic Python tool or external API call, and passes the raw output.
+   - **Step 4d (Audit Logging):** The `Tool Adapter` immediately dispatches an immutable, secret-redacted execution record with `trace_id` to `Audit Logger` (`CMP-09`).
+5. **Synthesis & Turn Commit:** The sanitized tool result is returned to `Aira Core Engine` for final natural-language synthesis -> Conversation turn and state mutations are committed to `Persistent Memory` (`CMP-06`) -> Response is delivered via `Notification Service` (`CMP-10`).
 
 ### 1.7 Trust Boundaries
 
@@ -128,9 +134,17 @@ Before detailing individual components, a foundational architectural decision is
 | **Resource Footprint (MacBook)** | Heavy (hundreds of MBs of duplicated runtime overhead per service). | **Lightweight** (< 100–200 MB RAM total). |
 | **Future Migration Path** | Prematurely locked into network boundaries that may not match actual bottlenecks. | Clean module interfaces (`Ports`) allow extracting heavy modules (e.g., MT5 Bridge or Background Worker) into separate processes in Stage 3/4 with zero domain rewrite. |
 
-**Architectural Decision:** AIRA MOCHTAR **shall be built as a Modular Monolith** for Stage 1 (MVP) and Stage 2. Each of the 10 components below is implemented as a strictly isolated code package/module with explicit public interfaces (`Ports`). Direct cross-module database table access is prohibited; modules interact only through their defined service contracts.
+**Architectural Decision:** AIRA MOCHTAR **shall be built as a Modular Monolith** for Stage 1 (MVP) and Stage 2. 
 
-> **Penjelasan Konsep (ID):** *Modular Monolith* berarti seluruh komponen Aira berjalan di dalam **satu aplikasi tunggal** di MacBook Anda (mudah dijalankan dan hemat RAM), tetapi di dalam kodenya setiap komponen dipisah ke dalam "ruangan/folder" yang rapi dan tertutup. Ini jauh lebih stabil dan cepat untuk tahap awal dibandingkan *Microservices* (memecah aplikasi menjadi 10 server kecil yang rumit dikelola).
+To eliminate overengineering and unnecessary boilerplate (`ADR-007`, `ISS-04`), the architecture enforces the **Four Principal External Ports Rule**:
+- **Formal abstract interfaces (`Ports`) are strictly reserved for true external I/O boundaries:**
+  1. `LLMProviderPort` / `EmbeddingProviderPort` (swappable AI providers: Google Gemini, Mock, Ollama)
+  2. `MemoryStorePort` (swappable persistence: SQLite 3, PostgreSQL + pgvector, in-memory test store)
+  3. `ChannelDeliveryPort` (swappable delivery adapters: CLI, Telegram, Mock)
+  4. `ToolAdapterPort` (swappable tool execution contracts: native Python functions, external MCP tools)
+- **All internal application services are straightforward concrete domain classes** (`AiraCoreEngine`, `ContextManager`, `PermissionEngine`, `NotificationHelper`, `ProjectService`, `DocumentService`, `MessageDraftService`, `AuditLogger`) without redundant single-implementation abstract base classes.
+
+> **Penjelasan Konsep (ID):** *Modular Monolith* berarti seluruh komponen Aira berjalan di dalam **satu aplikasi tunggal** di MacBook Anda (mudah dijalankan dan hemat RAM), tetapi di dalam kodenya setiap komponen dipisah ke dalam modul yang rapi dan tertutup. Untuk menghindari kerumitan yang tidak perlu (*overengineering*), kita hanya membuat 4 "colokan" (*Port*) untuk dunia luar (Model AI, Database, Chat Telegram/CLI, dan Alat Eksternal). Bagian dalam Aira langsung dibuat sebagai kelas konkret biasa sehingga kodenya ringkas dan mudah dipelihara.
 
 ---
 
@@ -138,99 +152,103 @@ Before detailing individual components, a foundational architectural decision is
 
 #### 1. `Aira Core Engine` (`core/engine`)
 - **Role:** Central executive orchestrator and persona guardian (`FR-CORE-001`, `FR-CORE-002`).
+- **Implementation:** Concrete class `AiraCoreEngine` coordinating the turn loop.
 - **Responsibilities:**
-  - Receive validated `UserRequest` or `SystemTrigger` events.
-  - Load immutable system persona instructions (Aira Mochtar's critical-thinking rules, anti-sycophancy mandate, epistemic uncertainty rules, and non-sentience guardrails).
-  - Coordinate the turn lifecycle across `Context Manager`, `AI Reasoning Provider`, `Permission Engine`, and `Integration Manager`.
-  - Handle `/cancel` and `/kill_all` interrupt signals via cancellation tokens (`FR-AUTO-004`).
+  - Receive validated `InboundUserRequest` or `SystemTrigger` events.
+  - Load immutable system persona instructions (critical thinking, anti-sycophancy, epistemic uncertainty disclosure, non-sentience boundary).
+  - Enforce the canonical execution sequence: `CoreEngine -> PermissionEngine -> ToolAdapter -> External Execution -> AuditLogger` (`ISS-03`).
+  - Register active turns in `ActiveTurnRegistry` bound to in-process `CancelToken` and Unix control socket for `/cancel` (`ADR-008`, `ISS-02`).
 - **MVP Scope (Stage 1):** Single-agent turn loop with tool-call execution and cancellation support.
-- **Future Scope (Stage 3):** Delegates multi-domain requests to `Agent Runtime` supervisor.
+- **Future Scope (Stage 3):** Delegates multi-domain requests to `Agent Runtime` supervisor (`CMP-14`).
 
 #### 2. `AI Reasoning Provider` (`providers/ai`)
 - **Role:** Vendor-agnostic gateway to LLM inference and text embedding models (`INT-001`, `NFR-006`).
+- **Implementation:** Implements `LLMProviderPort` and `EmbeddingProviderPort`.
 - **Responsibilities:**
-  - Expose abstract interfaces: `LLMProviderPort.generate()` and `EmbeddingProviderPort.embed()`.
-  - Translate internal message and tool-declaration structures into provider-specific payloads (Google Gemini API as primary implementation).
-  - Track input/output/reasoning token usage, latency, and estimated cost per call.
-  - Enforce timeouts, exponential backoff retries, and fallback model routing.
-- **MVP Scope (Stage 1):** Google Gemini API adapter (`generateContent` with structured tool declarations) + mock provider for unit testing.
-- **Future Scope (Stage 2–4):** Embedding adapter for vector search + secondary fallback adapter (local Ollama / alternative cloud LLM).
+  - Translate internal prompt representations to Google GenAI SDK (`google-genai`) calls for `gemini-2.5-flash` (interactive) and `gemini-2.5-pro` (analytical).
+  - Enforce pre-call token ceiling (`MAX_INPUT_TOKENS_PER_TURN`) and record exact post-call token usage in `llm_usage_ledger`.
+  - Handle retries with jitter on HTTP `429`/`503` and degrade gracefully from Pro to Flash.
+- **MVP Scope (Stage 1):** Gemini API adapter + deterministic Mock provider for unit tests.
+- **Future Scope (Stage 2–4):** Embedding adapter + local Ollama offline fallback.
 
 #### 3. `Context Manager` (`core/context`)
 - **Role:** Deterministic prompt and working-memory assembler (`FR-CORE-003`).
+- **Implementation:** Concrete class `ContextManager`.
 - **Responsibilities:**
-  - Construct the exact context window sent to the `AI Reasoning Provider` within a strict token budget.
-  - Inject real-time system clock metadata (`ISO-8601` timestamp, day of week, `Asia/Jakarta` timezone).
-  - Combine: (1) System Persona & Behavioral Rules, (2) Structured User Preferences, (3) Retrieved Relevant Notes/Tasks/Memories, (4) Delimited External Data (`<untrusted_content>`), and (5) Sliding Window of Recent Conversation Turns.
-  - Trigger session summarization when active conversation history approaches the context token threshold.
-- **MVP Scope (Stage 1):** Persona + timestamp + sliding session window + keyword-retrieved tasks/notes.
-- **Future Scope (Stage 2+):** Hybrid vector/lexical memory injection and automatic episodic compression.
+  - Inject real-time clock (`ISO-8601`, `Asia/Jakarta`).
+  - Retrieve active preferences, recent turns, and keyword-relevant notes/tasks from `MemoryStorePort`.
+  - Truncate prompt context to token budget using fast local heuristic estimation ($\lceil \text{bytes} / 3.5 \rceil$, `< 1 ms`) to satisfy `< 300 ms` SLA target (`NFR-001`, `ISS-09`).
+  - Encapsulate external content inside `<untrusted_external_data>` XML tags and set the `is_tainted` flag (`SEC-003`, `ISS-05`).
+- **MVP Scope (Stage 1):** Persona + clock + sliding turn window + FTS5-retrieved notes/tasks.
+- **Future Scope (Stage 2+):** Semantic vector search injection and episodic summaries.
 
-#### 4. `Persistent Memory` (`memory/store`)
+#### 4. `Persistent Memory Store` (`memory/store`)
 - **Role:** Stateful storage and retrieval engine for all user knowledge, tasks, and historical context (`FR-PERS-001`–`004`, `SYS-002`).
+- **Implementation:** Implements `MemoryStorePort` (`SQLiteMemoryStore` in Stage 1; `PostgresMemoryStore` in Stage 2+).
 - **Responsibilities:**
-  - Manage CRUD and search operations across five logical repositories:
-    1. `SessionRepository` (short-term chat turns)
-    2. `TaskAndProjectRepository` (tasks, commitments, project milestones)
-    3. `KnowledgeNoteRepository` (personal notes, academic bibliography, SOP documents)
-    4. `DecisionRepository` (decision matrices, assumptions, and post-decision reviews)
-    5. `UserPreferenceRepository` (structured user profile and configuration facts)
-- **MVP Scope (Stage 1):** SQLite (WAL mode) with FTS5 full-text search for tasks, notes, preferences, and session history.
-- **Future Scope (Stage 2+):** PostgreSQL + `pgvector` for semantic vector embeddings, episodic summaries, and cross-domain knowledge graphs.
+  - Provide CRUD and search operations across core repositories:
+    1. `SessionRepository`: Store and query chat turns.
+    2. `TaskRepository`: Task management, priority filtering, and deadline tracking (`FR-PERS-001`).
+    3. `NoteRepository`: Note storage and SQLite FTS5 (BM25) full-text search (`FR-PERS-002`).
+    4. `PreferenceRepository`: Structured user profile settings.
+    5. `ProjectService` (`FR-BIZ-001`, Stage 2): Manage business projects, milestones, and deliverable dependencies (`ISS-04`).
+    6. `DocumentService` (`FR-BIZ-002`, Stage 2): Manage SOP templates and generated business documents (`ISS-04`).
+    7. `MessageDraftService` (`FR-COMM-003`, Stage 2): Manage staged outbound message drafts pending HITL approval (`ISS-04`).
+    8. `DecisionRepository` (`FR-PERS-004`, Stage 2): Decision records and retrospective evaluations.
+- **MVP Scope (Stage 1):** SQLite (WAL mode) with FTS5 search for tasks, notes, preferences, and session history.
+- **Future Scope (Stage 2+):** PostgreSQL + `pgvector` hybrid search (BM25 + cosine RRF) and episodic summaries.
 
 #### 5. `Agent Runtime` (`agents/runtime`)
 - **Role:** Multi-agent supervisor and domain subagent execution sandbox (`FR-AUTO-003`, `PERM-003`).
-- **Responsibilities:**
-  - Decompose complex, multi-step objectives into domain-scoped subtasks.
-  - Instantiate specialized subagents (*Personal*, *Comms*, *Business/Canva*, *Academic*, *Financial MT5*) with isolated context slices and restricted tool manifests.
-  - Enforce per-subagent step limits (e.g., max 15 steps) and token budgets.
-  - Validate subagent outputs at the Supervisor level before committing state or requesting HITL approval.
-- **MVP Scope (Stage 1):** Inactive (bypassed; `Aira Core Engine` executes tools directly in a single-agent loop as required by Section 10.2 of `PRODUCT_REQUIREMENTS.md`).
-- **Future Scope (Stage 3):** Full Supervisor-Subagent orchestration.
+- **Implementation:** Concrete class `AgentSupervisor` managing sandboxed `DomainSubagent` runners.
+- **MVP Scope (Stage 1):** Inactive (bypassed; `AiraCoreEngine` executes tools directly in single-agent loop).
+- **Future Scope (Stage 3):** Decomposes cross-domain goals into sandboxed subtasks (Personal, Comms, Business, Academic, Financial) with 15-step limits and isolated tool manifests.
 
-#### 6. `Integration Manager` (`integrations/manager`)
-- **Role:** Standardized tool registry, schema validator, and execution bus (`FR-AUTO-001`, `NFR-002`, `NFR-003`).
+#### 6. `Integration Manager & Tool Adapter` (`integrations/manager`)
+- **Role:** Tool registry, schema validator, and deterministic execution bus (`FR-AUTO-001`, `NFR-002`, `NFR-003`).
+- **Implementation:** Implements `ToolAdapterPort`.
 - **Responsibilities:**
-  - Maintain the catalog of available deterministic tools and their JSON Schema input definitions.
-  - Validate LLM-generated tool arguments against strict schemas before execution.
-  - Execute deterministic calculation modules (e.g., financial math, date arithmetic) in native code (`NFR-002`).
-  - Isolate external API timeouts and errors so third-party failures never crash the core process (`NFR-003`).
+  - Maintain the catalog of registered tools and Pydantic/JSON Schema input definitions.
+  - **Policy Enforcement Integration (`ISS-03`):** Refuse to execute any tool unless invoked with a valid, unforgeable `PolicyClearance` token from `PermissionEngine`.
+  - Execute deterministic Python calculation modules (financial math, date arithmetic) in native code (`NFR-002`).
+  - Isolate timeouts and dispatch sanitized execution records to `AuditLogger`.
 - **MVP Scope (Stage 1):** Internal deterministic tools (Task CRUD, Note CRUD/Search, System Status, Time/Date utilities).
-- **Future Scope (Stage 2–3):** Scholarly API adapters (`Stage 2`), standardized Model Context Protocol (MCP) client bus, Canva MCP/API, WhatsApp API, and MT5 Telemetry Bridge (`Stage 3`).
+- **Future Scope (Stage 2–3):** Scholarly API adapters, Model Context Protocol (MCP) bus, Canva MCP, WhatsApp Cloud API, and MT5 Telemetry Bridge.
 
 #### 7. `Workflow Engine` (`workflows/engine`)
 - **Role:** Asynchronous scheduler, state-machine runner, and proactive automation coordinator (`FR-AUTO-002`, `FR-COMM-002`).
-- **Responsibilities:**
-  - Run cron-scheduled jobs (Morning & Evening Daily Briefings, deadline checks, database backups).
-  - Manage multi-step stateful workflows that pause at `AWAITING_USER_APPROVAL` checkpoints and resume upon receiving a valid HITL approval signal.
-  - Enforce idempotency keys (`job_run_id`) and exponential-backoff retry policies.
+- **Implementation:** Concrete class `WorkflowScheduler`.
 - **MVP Scope (Stage 1):** Basic in-memory task tracking and manual command execution (`/briefing` on demand).
-- **Future Scope (Stage 2+):** Persistent cron scheduler, automated Daily Briefings, and resumable DAG state machines.
+- **Future Scope (Stage 2+):** Persistent cron scheduler (`MorningBriefingJob`, `EveningBriefingJob`, `DailyBackupJob`), idempotency keys, and resumable HITL state machines.
 
-#### 8. `Notification Service` (`communication/notifications`)
-- **Role:** Outbound communication router, formatter, and attention guardian (`FR-COMM-001`, `FR-COMM-004`).
+#### 8. `Notification Helper & Service` (`communication/notifications`)
+- **Role:** Outbound message formatter, 4,096-character paginator, and attention guardian (`FR-COMM-001`, `FR-COMM-004`).
+- **Implementation:** Concrete helper module `NotificationHelper` in Stage 1 (`ISS-08`); expanded to stateful queuing service in Stage 2.
 - **Responsibilities:**
-  - Format system responses, briefings, and alerts for target channels (Telegram MarkdownV2/HTML, CLI ANSI formatting, future Web UI).
-  - Paginate long outputs exceeding Telegram's 4,096-character limit cleanly.
-  - Enforce urgency classification (`LOW`, `NORMAL`, `HIGH`, `CRITICAL`), Quiet Hours queuing, and cooldown deduplication.
-- **MVP Scope (Stage 1):** Direct CLI output and Telegram owner message delivery with automatic 4,096-character pagination.
-- **Future Scope (Stage 2+):** Quiet Hours batching, urgency filtering, and inline approval keyboard rendering.
+  - Safely format Markdown for Telegram/CLI and paginate messages exceeding Telegram's 4,096-character limit (`INT-002`).
+  - Render inline approval buttons (`[Approve]`, `[Reject]`) for `Tier C` HITL prompts.
+  - In Stage 2 (`FR-COMM-004`), enforce Quiet Hours queuing and alert deduplication.
+- **MVP Scope (Stage 1):** Direct formatting, Telegram/CLI pagination, and immediate delivery via `ChannelDeliveryPort`.
+- **Future Scope (Stage 2+):** Urgency classification, Quiet Hours batching, and alert deduplication.
 
 #### 9. `Permission Engine` (`security/permissions`)
 - **Role:** Deterministic policy enforcement point and Human-in-the-Loop (HITL) approval gateway (`PERM-001`–`004`).
+- **Implementation:** Concrete class `PermissionEngine`.
 - **Responsibilities:**
-  - Evaluate every proposed tool invocation against the **4-Tier Permission Classification** (`Tier A: READ_ONLY`, `Tier B: LOCAL_WRITE_REVERSIBLE`, `Tier C: CONSEQUENTIAL_HITL`, `Tier D: PROHIBITED_GUARDRAIL`).
-  - Generate single-use, expiring approval records bound to the SHA-256 hash of the proposed action payload (`PERM-002`).
-  - Verify cryptographic approval callbacks before unlocking `Tier C` tool execution.
-- **MVP Scope (Stage 1):** 4-Tier policy classifier + CLI confirmation prompt for `Tier C` + unconditional block for `Tier D`.
-- **Future Scope (Stage 2+):** Stateful Telegram inline button approval workflow with TTL expiration and subagent sandbox enforcement.
+  - Classify proposed tool calls into the **4-Tier Permission Classification** (`Tier A: READ_ONLY`, `Tier B: LOCAL_WRITE_REVERSIBLE`, `Tier C: CONSEQUENTIAL_HITL`, `Tier D: PROHIBITED_GUARDRAIL`).
+  - Apply **Sink-Aware Taint Policy (`ISS-05`)**: allow safe local note saving (`save_note` tagged `external_derived`) to remain `Tier B`, while escalating control mutations (preferences, schedules) to `Tier C`.
+  - Generate single-use approval records bound to `SHA256(canonical_json(tool, args))` with TTL (`PERM-002`).
+  - Verify approval callbacks before issuing a `PolicyClearance` token to `ToolAdapter`.
+- **MVP Scope (Stage 1):** 4-Tier policy classifier + CLI confirmation prompt + Telegram inline approval tokens + unconditional block for `Tier D`.
+- **Future Scope (Stage 2+):** Stateful Telegram inline callback flow with TTL expiration and subagent sandbox enforcement.
 
 #### 10. `Audit Logger` (`security/audit`)
 - **Role:** Immutable forensic recorder and secret redaction filter (`NFR-004`, `SEC-001`, `SEC-004`).
+- **Implementation:** Concrete class `AuditLogger`.
 - **Responsibilities:**
-  - Intercept and sanitize all log events and audit records to strip API keys, tokens, and credentials (`REDACTED_SECRET`).
-  - Write structured JSON logs to disk/stdout and insert append-only records into the `audit_logs` database table.
-  - Record `trace_id`, actor, tool name, permission tier, approval token ID, token consumption, latency, and outcome status.
+  - Scrub all log lines, error messages, and audit payloads to strip registered secrets (`[REDACTED_SECRET]`).
+  - Write structured JSON log lines (`trace_id`, timestamp, latency, token usage) to `data/logs/aira.jsonl`.
+  - Insert append-only records into the `audit_logs` table protected by SQLite `RAISE(ABORT)` triggers.
 - **MVP Scope (Stage 1):** Full append-only SQLite `audit_logs` table + structured JSON file logger with secret scrubbing.
 - **Future Scope (Stage 4):** Cloud telemetry export and visual audit inspector on the Web Dashboard.
 
@@ -263,6 +281,58 @@ Before detailing individual components, a foundational architectural decision is
      - `callback_data: "hitl:approve:<approval_id>:<hmac_short>"`
      - `callback_data: "hitl:reject:<approval_id>:<hmac_short>"`
    - When the owner taps a button on Telegram, the `TelegramAdapter` receives the `callback_query`, verifies the owner ID and HMAC/state, updates the original Telegram message to show `[APPROVED at 15:45 WIB]`, and triggers the `Workflow Engine` to resume execution.
+
+### 3.3 Cooperative & Cross-Process Task Cancellation Model (`ISS-02`, `ADR-008`)
+
+To safely interrupt running turns, long-running agent loops, or external operations without data corruption or ghost executions, Aira implements a dual-channel cancellation architecture:
+
+```
+[Telegram Channel]                          [CLI Channel (Separate Process)]
+  User sends "/cancel"                        User runs: aira cancel <turn_id>
+         |                                                   |
+         v                                                   v
+TelegramAdapter                             CLI Client (aira CLI)
+         |                                                   |
+         | (in-process method call)                          | (Local IPC: data/aira.sock)
+         v                                                   v
+ActiveTurnRegistry.cancel(turn_id) <---------- IPC Control Server (Unix Socket)
+         |                                                   |
+         +-------------------------+-------------------------+
+                                   |
+                1. Set cancel_token (asyncio.Event)
+                2. Insert into SQLite cancellation_signals
+                                   |
+                                   v
+             [Cooperative Cancellation Checkpoints]
+             - Between tool execution steps
+             - Abort LLM stream / socket wait via asyncio.wait_for
+             - Rollback open transactions & record CANCELLED status
+                                   |
+                                   v
+             [Acknowledge Cancellation to Telegram / CLI]
+```
+
+1. **Single Application Runtime & Active Turn Registry:**
+   - The Stage 1 daemon maintains an in-memory `ActiveTurnRegistry` mapping each active `turn_id` and `session_id` to an in-process `CancelToken` (encapsulating an `asyncio.Event`).
+   - Every asynchronous task checks `cancel_token.is_cancelled()` at deterministic checkpoints: before assembling context, before dispatching to the LLM, before evaluating permissions, and between multi-step tool calls.
+2. **In-Process Telegram Cancellation:**
+   - When the user sends `/cancel` or `/stop` via Telegram, `TelegramAdapter` queries `ActiveTurnRegistry` for the active turn in that session and triggers `cancel_token.cancel()`.
+   - The running turn detects the cancellation, rolls back any uncommitted database transaction, records `CANCELLED` status in `audit_logs`, and immediately sends an acknowledgment back to Telegram: *"Turn cancelled by owner."*
+3. **Cross-Process CLI Cancellation via Authenticated IPC:**
+   - When a user runs a CLI command (e.g., `aira cancel --all` or `aira cancel <turn_id>`) from a separate terminal window, the CLI cannot access the daemon's Python memory space directly.
+   - The Stage 1 daemon binds to a local Unix Domain Socket at `data/aira.sock` (file permissions `0600`, owner-only).
+   - The CLI client connects to `data/aira.sock`, passes a local authentication handshake, and transmits a structured JSON control message:
+     ```json
+     {"action": "cancel", "turn_id": "trn_982a", "auth_token": "local_daemon_nonce"}
+     ```
+   - The daemon's IPC listener receives the command, looks up the target turn in `ActiveTurnRegistry`, triggers its `CancelToken`, and returns an immediate JSON acknowledgment to the CLI.
+4. **Persistent Cancellation Records in SQLite:**
+   - In addition to in-memory signaling, cancellation events are written to the `cancellation_signals` table in SQLite (`signal_id`, `turn_id`, `channel`, `reason`, `status`, `created_at`, `acknowledged_at`).
+   - This guarantees that if a background worker or subagent is queued or restarting, it checks for pending cancellation signals upon waking up before executing any further steps.
+5. **Handling Uninterruptible External Network Calls:**
+   - External network I/O (e.g., waiting on Gemini API responses or external HTTP tools) cannot always be interrupted instantly at the OS socket level.
+   - All external calls are wrapped inside strict `asyncio.wait_for(coroutine, timeout=...)` envelopes tied to the `CancelToken`.
+   - When cancelled, the coroutine is cancelled immediately, the underlying socket connection is closed/abandoned, and the task aborts without waiting for the remote server to finish generating tokens.
 
 ---
 
@@ -386,12 +456,15 @@ The primary adapter (`GeminiProviderAdapter`) integrates with the official Googl
 
 ## 6. Security Architecture
 
-### 6.1 Authentication, Authorization & Owner Verification (`SEC-002`)
+### 6.1 Authentication, Authorization & Owner Verification (`SEC-002`, `ISS-07`)
 
 AIRA MOCHTAR is a **single-tenant, owner-sovereign system**. It does not allow public user registration:
 
-- **Telegram Owner Verification:** Every inbound Telegram update (`message`, `edited_message`, `callback_query`) is inspected by `OwnerAuthGuard` as the very first middleware step. The numeric `from.id` must strictly match `AUTHORIZED_TELEGRAM_USER_IDS` loaded from read-only startup configuration. Any mismatch is immediately dropped, returning zero payload to the sender and writing a `SECURITY_UNAUTHORIZED_INGRESS` record to `Audit Logger`.
-- **CLI Authentication:** Relies on local OS user-account isolation on the developer's MacBook (file permissions `0600` on `.env` and SQLite database files).
+- **Telegram Owner Verification:** Every inbound Telegram update (`message`, `edited_message`, `callback_query`) is inspected by `OwnerAuthGuard` as the very first middleware step:
+  1. **User ID Check:** The numeric `from.id` must strictly match `AUTHORIZED_TELEGRAM_USER_IDS` loaded from read-only startup configuration.
+  2. **Private Chat Check (`ISS-07`):** The chat type must satisfy `message.chat.type == "private"`. Group chats, supergroups, and channels are unconditionally dropped and ignored at the transport boundary to prevent unauthorized multi-user ingress, eavesdropping, or group-based prompt injection attacks.
+  3. Any update failing either check is immediately dropped, returning zero payload to the sender and writing a `SECURITY_UNAUTHORIZED_INGRESS` record to `Audit Logger`.
+- **CLI Authentication:** Relies on local OS user-account isolation on the developer's MacBook (file permissions `0600` on `.env` and SQLite database files) and local Unix socket authentication (`data/aira.sock`).
 - **Webhook Verification (Stage 3/4):** Validates cryptographic HMAC signatures (`X-Telegram-Bot-Api-Secret-Token` and Meta `X-Hub-Signature-256`) in constant time (`hmac.compare_digest`) before parsing request bodies.
 
 ### 6.2 Four-Tier Permission Enforcement & Approval Gateway (`PERM-001`, `PERM-002`)
@@ -431,9 +504,9 @@ Every tool registered in `Integration Manager` carries an immutable `PermissionT
    - All external API traffic uses `TLS 1.2+` / `TLS 1.3`.
    - Local MacBook storage relies on macOS FileVault full-disk encryption (with optional SQLCipher database encryption for sensitive tables); Stage 4 Cloud PostgreSQL uses AES-256 encryption at rest and mTLS for hybrid bridge traffic.
 
-### 6.4 Prompt Injection Protection (`SEC-003`)
+### 6.4 Prompt Injection Protection & Sink-Aware Taint Policy (`SEC-003`, `ISS-05`)
 
-To defend against **Indirect Prompt Injection** (where malicious instructions are embedded inside an external academic abstract, web page, or inbound message):
+To defend against **Indirect Prompt Injection** (where malicious instructions are embedded inside an external academic abstract, web page, or inbound message) without causing severe approval fatigue for normal daily operations:
 
 1. **Structural Delimitation:** All external untrusted text is sanitized of control tags and wrapped inside explicit XML boundary markers:
    ```xml
@@ -442,7 +515,12 @@ To defend against **Indirect Prompt Injection** (where malicious instructions ar
    </untrusted_external_data>
    ```
 2. **System Instruction Hardening:** The core system prompt explicitly instructs the model that text inside `<untrusted_external_data>` is passive data to be analyzed or summarized, and must never be followed as instructions or commands.
-3. **Taint Tracking in Permission Engine:** If the current turn context contains `<untrusted_external_data>`, the `Permission Engine` marks the turn as `tainted = True` and automatically escalates any non-read-only tool invocation to require explicit `Tier C` human confirmation.
+3. **Sink-Aware Taint Tracking in Permission Engine (`ISS-05`):**
+   - When external content is ingested into the active context, the turn receives a provenance label `source_trust = "external_derived"` and `is_tainted = True`.
+   - Rather than naively escalating *every* local operation to Tier C (which causes approval fatigue whenever the user saves notes from papers), the `Permission Engine` differentiates between **Safe Internal Sinks** and **Control / External Sinks**:
+     - **Safe Internal Sinks (`Tier B` Maintained):** Operations that store or summarize notes and tasks locally (`save_note`, `tag_task`, `create_task`) maintain `Tier B` (Local Reversible Write) execution even when context is tainted, provided they tag the stored record with `source_trust: "external_derived"`.
+     - **Control & Configuration Sinks (`Escalated to Tier C`):** Any tool that alters system rules, user preferences, security configuration, or scheduled workflows (`set_user_preference`, `update_system_config`, `modify_workflow_schedule`) is immediately escalated to `Tier C` (Consequential HITL), requiring explicit owner confirmation before applying changes derived from tainted context.
+     - **External Egress Sinks (`Tier C` Enforced):** Any action that communicates externally (`send_message`, `publish_canva`, `send_email`) remains strictly `Tier C` with payload-bound SHA-256 confirmation.
 
 ---
 
@@ -477,7 +555,7 @@ aira-mochtar/
 └── .env.example                        # Safe template with placeholder variable names only
 ```
 
-### 7.2 Local Database Strategy (`SYS-002`)
+### 7.2 Local Database Strategy & Dialect Portability (`SYS-002`, `ISS-06`, `ADR-005`)
 
 For Stage 1 on a MacBook, **SQLite 3** is selected as the local database engine, configured for high-concurrency reliability:
 
@@ -487,6 +565,22 @@ For Stage 1 on a MacBook, **SQLite 3** is selected as the local database engine,
   - `PRAGMA foreign_keys = ON;` (Strict relational integrity).
   - `PRAGMA busy_timeout = 5000;` (Prevents `SQLITE_BUSY` lock errors when CLI and Telegram polling access the DB simultaneously).
 - **Full-Text Search:** Uses SQLite's built-in **FTS5** virtual tables to index `knowledge_notes` and `tasks` for fast BM25 keyword retrieval with zero external vector database processes needed in Stage 1.
+- **Dialect Boundary & Storage Portability (`ISS-06`):**
+  - Application business logic and domain repositories **never execute raw SQLite SQL strings** outside the repository adapters.
+  - All database interactions are mediated by repository classes implementing the canonical `MemoryStorePort` (e.g., `TaskRepository`, `NoteRepository`).
+  - Key dialect differences are encapsulated entirely inside adapter implementations:
+    - *Full-Text Search:* SQLite uses `FTS5` virtual tables with `MATCH` syntax; PostgreSQL uses `tsvector`/`tsquery` and `GIN` indexes.
+    - *Date/Time:* SQLite stores ISO-8601 strings or Unix epoch integers; PostgreSQL uses native `TIMESTAMPTZ`.
+    - *Append-Only Protection:* SQLite enforces immutability via `BEFORE UPDATE OR DELETE ... RAISE(ABORT)` triggers; PostgreSQL uses PL/pgSQL functions or role-level permissions.
+- **SQLite to PostgreSQL Migration Utility (`ISS-06`):**
+  - A dedicated CLI command `aira db migrate-to-pg --sqlite-path <path> --pg-dsn <dsn>` is provided for the Stage 2 transition.
+  - The migration script operates by:
+    1. Instantiating a source `SQLiteMemoryStore` and a target `PostgresMemoryStore`.
+    2. Extracting records in topological order (Users -> Preferences -> Projects -> Tasks -> Notes -> Audit Logs).
+    3. Validating every record against Pydantic domain models to guarantee schema integrity.
+    4. Batch-inserting records inside an atomic PostgreSQL transaction.
+    5. Rebuilding PostgreSQL `tsvector` full-text search indexes and generating embeddings for the vector store.
+    6. Running row count and checksum parity checks before declaring migration success.
 
 ### 7.3 Environment Configuration & Validation (`SYS-001`, `SEC-001`)
 
@@ -615,12 +709,15 @@ flowchart TB
     CoreEngine <--> AIProvider
     CoreEngine <--> WorkflowEng
     CoreEngine <--> AgentRuntime
-    AgentRuntime --> IntManager
-    CoreEngine --> IntManager
 
-    IntManager --> PermEngine
-    PermEngine -->|"Tier A/B Approved"| IntManager
+    %% Canonical Policy & Tool Execution Flow (ISS-03)
+    CoreEngine --> PermEngine
+    AgentRuntime --> PermEngine
+    PermEngine -->|"PolicyClearance (Tier A/B)"| IntManager
     PermEngine -->|"Tier C Pause for Approval"| NotifService
+    IntManager -->|"Local State Mutation"| MemoryStore
+    IntManager -->|"External Tool Execution"| ExtExecution["External Services & APIs"]
+
     CoreEngine --> NotifService
     NotifService --> CLIAdapter
     NotifService --> TGAdapter
@@ -630,6 +727,7 @@ flowchart TB
     CoreEngine -.-> AuditLog
     PermEngine -.-> AuditLog
     IntManager -.-> AuditLog
+    ExtExecution -.-> AuditLog
     SecretVault -.->|"Injects Scoped Credentials"| AIProvider
     SecretVault -.->|"Injects Scoped Credentials"| TGAdapter
 ```
@@ -665,9 +763,11 @@ sequenceDiagram
     Core->>Perm: evaluate_tool_call(name, args, trace_id)
     alt Tier A (Read-Only) or Tier B (Local Reversible Write)
         Perm->>Audit: Log AUTO_APPROVED tool call
-        Perm-->>Core: Execution Permitted
-        Core->>Tool: execute(name, args)
+        Perm-->>Core: Issue PolicyClearance(token)
+        Core->>Tool: execute(name, args, PolicyClearance)
+        Tool->>Tool: Verify PolicyClearance token validity
         Tool->>Mem: Read or mutate local state
+        Tool->>Audit: Log tool execution record (latency, status)
         Tool-->>Core: Return structured ToolResult
         Core->>AI: Synthesize final response with ToolResult
         AI-->>Core: Return final analytical response
@@ -680,7 +780,10 @@ sequenceDiagram
         Perm-->>Owner: Send Telegram Inline Approval [Approve] [Reject]
         Owner->>Ingress: Click [Approve] callback
         Ingress->>Perm: Verify Owner ID, TTL & SHA-256 payload hash
-        Perm->>Tool: Execute approved action
+        Perm->>Audit: Log HITL_APPROVED
+        Perm->>Tool: execute(name, args, PolicyClearance)
+        Tool->>Tool: Verify PolicyClearance token validity
+        Tool->>Audit: Log external execution record
         Tool-->>Owner: Deliver execution confirmation
     else Tier D (Prohibited Guardrail)
         Perm->>Audit: Log CRITICAL_POLICY_VIOLATION
@@ -859,4 +962,22 @@ To ensure engineering decisions are grounded in pragmatic reality rather than hy
 | **Local Persistence** | SQLite 3 (`WAL` mode + `FTS5` full-text search) + SQL migrations | Zero external daemon required on MacBook; instant backups; ACID safe. |
 | **Communication Adapters** | Local CLI (`Typer`/`Rich`) + Telegram Bot API (`aiogram` / `httpx` Long-Polling) | Works behind home NAT/Wi-Fi with zero open ports and instant mobile access. |
 | **Governance & Security** | Deterministic 4-Tier `PermissionEngine` + Append-Only `audit_logs` + Secret Redactor | Enforces all `P0` security and permission requirements from Day 1. |
+
+---
+
+### 10.6 Performance Realism & Empirical Resource Budgets (`NFR-001`, `ISS-09`)
+
+To avoid ungrounded theoretical claims, all performance, latency, and memory metrics defined in the specification are treated as **empirical design budgets** to be verified by automated benchmark tests (`GATE-MVP-01`):
+
+1. **Process Memory Budget (`< 100 MB` Idle Target):**
+   - The Stage 1 Modular Monolith on macOS targets an idle RSS memory footprint under 100 MB.
+   - Verified during implementation by running `ps -o rss` against the daemon with SQLite WAL open and Telegram long-polling active. If SQLite caching or Python runtime overhead exceeds 100 MB, the pragma cache size is tuned (`PRAGMA cache_size = -2000`).
+2. **Context Assembly Budget (`< 300 ms` SLA Target):**
+   - The `ContextManager` budget allocates 300 ms for SQLite queries (recent turns + active preferences + FTS5 search) and prompt assembly.
+   - Token budget truncation uses a fast local heuristic ($\lceil \text{bytes} / 3.5 \rceil$, `< 1 ms`) rather than slow external tokenizer round-trips.
+3. **Turn-Around Latency Targets (`NFR-001`):**
+   - `Typing` indicator dispatch: `< 1,500 ms` (target `< 500 ms`).
+   - Fast interactive turn (`Tier-Fast`): `< 3 s` network-dependent target.
+   - Deep reasoning turn (`Tier-Pro`): `< 8 s` network-dependent target.
+   - Network variances on external Google Gemini endpoints are decoupled from internal processing budgets via latency logging in `audit_logs`.
 

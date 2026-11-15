@@ -15,15 +15,21 @@
 
 This document provides the low-level component engineering specification for **AIRA MOCHTAR**. It decomposes the Modular Monolith and Hexagonal (Ports & Adapters) architecture defined in `docs/architecture/SYSTEM_ARCHITECTURE.md` into concrete, testable software components.
 
-### Key Architectural Constraints
+### Key Architectural Constraints & Four External Ports (`ADR-007`)
 
 1. **Zero Existing Code Assumption:** No runtime code currently exists in the workspace. All package paths (`src/aira/...`), interfaces (`*Port`), and data transfer objects (`DTOs`) defined in this document represent the target engineering blueprint.
 2. **Strict Separation of MVP vs. Future Components:**
    - **Part I (`CMP-01` through `CMP-10`):** **Stage 1 (MVP) Core Components (`P0`)** required for the initial local MacBook prototype.
    - **Part II (`CMP-11` through `CMP-17`):** **Future Components (`P1`–`P3`)** planned for Stage 2 (Persistent System), Stage 3 (Multi-Agent & Domain Expansion), and Stage 4 (Cloud Platform).
-3. **Acyclic Dependency Rule (Clean Hexagonal Boundaries):**
-   - Outer layers (Interfaces, Providers, Database Adapters) depend inward on **Ports** (`src/aira/ports`).
-   - Inner layers (`Aira Core Engine`, `Context Manager`, `Permission Engine`) **never** import concrete external SDKs (such as `google.genai`, `aiogram`, or `sqlite3`) directly.
+3. **Four Principal External Ports Pattern (`ADR-007`, `ISS-04`):**
+   - To avoid overengineering and abstract interface bloat, abstract Ports are strictly reserved for external I/O boundaries:
+     1. `LLMProviderPort`: Boundary to external LLM providers (Gemini API adapter in `CMP-05`, Mock provider for tests).
+     2. `MemoryStorePort`: Boundary to persistence engines (`SQLiteMemoryStore` in `CMP-06` for Stage 1; `PostgresMemoryStore` in Stage 2+).
+     3. `ChannelDeliveryPort`: Boundary to egress communication channels (`TelegramBotAdapter`, `RichCLIAdapter` in `CMP-02`).
+     4. `ToolAdapterPort`: Boundary to external and local tool execution adapters (`CMP-07`).
+   - All internal coordinators (`AiraCoreEngine`, `ContextManager`, `PermissionEngine`, `AuditLogger`, `NotificationHelper`, `ProjectService`, `DocumentService`, `MessageDraftService`) are **concrete domain classes/modules** directly invoked without intermediate abstract interfaces.
+4. **Canonical Execution Call Graph (`ISS-03`):**
+   - Tool execution strictly follows: **Core Engine $\rightarrow$ Permission Engine $\rightarrow$ Tool Adapter $\rightarrow$ External Execution $\rightarrow$ Audit Logger**. Tools refuse to execute without a valid `PolicyClearance` token issued by the Permission Engine.
 
 ---
 
@@ -55,17 +61,17 @@ The following 10 components form the **Stage 1 Local AI Prototype**. Together, t
 
 | Attribute | Specification |
 | :--- | :--- |
-| **1. Component Name** | **Ingress Adapters & Owner Auth Guard** (`src/aira/interfaces`) |
-| **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-COMM-001`, `INT-002`, `SEC-002`, `NFR-001` |
-| **2. Purpose** | Serves as the authenticated front door for the human owner via the MacBook Terminal (CLI) and Telegram Bot API (Long-Polling), rejecting unauthorized callers at the perimeter and normalizing valid inputs into typed internal requests. |
-| **3. Responsibilities** | 1. **Telegram Adapter:** Maintain resilient outbound HTTPS long-polling (`getUpdates`) with Telegram servers.<br/>2. **Owner Auth Guard (`SEC-002`):** Verify `message.from.id` and `callback_query.from.id` against `AUTHORIZED_TELEGRAM_USER_IDS` before parsing content.<br/>3. **Immediate Acknowledgment (`NFR-001`):** Dispatch `sendChatAction("typing")` within 1.5 seconds of receiving a valid owner message.<br/>4. **CLI Adapter:** Provide interactive REPL (`aira chat`) and direct command execution (`aira tasks`, `aira notes`, `aira status`, `aira cancel`).<br/>5. Normalize raw CLI strings or Telegram payloads into a canonical `InboundUserRequest` with a freshly generated UUIDv4 `trace_id`. |
-| **4. Inputs** | - Raw Telegram JSON Updates (`message`, `callback_query`) via HTTPS long-polling.<br/>- Local terminal `stdin` and command-line arguments.<br/>- Whitelisted owner ID list from `CMP-01`. |
-| **5. Outputs** | - Normalized `InboundUserRequest(trace_id, channel, user_id, command_or_text, attachments, timestamp)`.<br/>- Normalized `CancellationSignal(trace_id, target_task_id, scope)` when `/cancel` or `/kill_all` is invoked.<br/>- `SecurityAuditEvent` sent to `CMP-09` (`Audit Logger`) upon any unauthorized ingress attempt. |
-| **6. Dependencies** | - **Internal:** `CMP-01` (Config/Secrets), `CMP-03` (`Aira Core Engine` via `InboundRequestPort`), `CMP-09` (`Audit Logger`).<br/>- **External:** Telegram Bot API over HTTPS (`httpx` / `aiogram`), CLI framework (`typer` / `rich`). |
+| **1. Component Name** | **Ingress Adapters, IPC Control & Owner Auth Guard** (`src/aira/interfaces`) |
+| **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-COMM-001`, `INT-002`, `SEC-002`, `NFR-001`, `ISS-02`, `ISS-07` |
+| **2. Purpose** | Serves as the authenticated front door for the human owner via the MacBook Terminal (CLI), local Unix socket IPC, and Telegram Bot API (Long-Polling), rejecting unauthorized callers at the perimeter and normalizing valid inputs into typed internal requests. |
+| **3. Responsibilities** | 1. **Telegram Adapter:** Maintain resilient outbound HTTPS long-polling (`getUpdates`) with Telegram servers.<br/>2. **Owner Auth Guard (`SEC-002`, `ISS-07`):** Verify `message.from.id` and `callback_query.from.id` against `AUTHORIZED_TELEGRAM_USER_IDS` AND enforce `message.chat.type == "private"` before parsing content (unconditionally drop group chats and channels).<br/>3. **Immediate Acknowledgment (`NFR-001`):** Dispatch `sendChatAction("typing")` within 1.5 seconds of receiving a valid owner message.<br/>4. **CLI Adapter & Local IPC Control (`ISS-02`, `ADR-008`):** Provide interactive REPL (`aira chat`) and single-shot commands. When background daemon runs, bind to local Unix Domain Socket `data/aira.sock` (`0600`) to receive authenticated cross-process commands (`aira cancel`, `aira status`).<br/>5. Normalize raw CLI strings, IPC packets, or Telegram payloads into a canonical `InboundUserRequest` with a freshly generated UUIDv4 `trace_id`. |
+| **4. Inputs** | - Raw Telegram JSON Updates (`message`, `callback_query`) via HTTPS long-polling.<br/>- Local terminal `stdin` and command-line arguments.<br/>- Local IPC JSON control requests over Unix Domain Socket (`data/aira.sock`).<br/>- Whitelisted owner ID list from `CMP-01`. |
+| **5. Outputs** | - Normalized `InboundUserRequest(trace_id, channel, user_id, command_or_text, attachments, timestamp)`.<br/>- Normalized `CancellationSignal(trace_id, target_turn_id, scope)` when `/cancel` or CLI `aira cancel` is invoked.<br/>- `SecurityAuditEvent` sent to `CMP-09` (`Audit Logger`) upon any unauthorized ingress attempt. |
+| **6. Dependencies** | - **Internal:** `CMP-01` (Config/Secrets), `CMP-03` (`Aira Core Engine` via `InboundRequestPort`), `CMP-09` (`Audit Logger`).<br/>- **External:** Telegram Bot API over HTTPS (`httpx` / `aiogram`), CLI framework (`typer` / `rich`), `asyncio` Unix domain socket server. |
 | **7. Interfaces** | - **Inbound (Driving):** Calls `InboundRequestPort.handle_user_request(request: InboundUserRequest) -> TurnResponse`<br/>- **Inbound (Cancel):** Calls `InboundRequestPort.handle_cancel(signal: CancellationSignal) -> CancelResult`<br/>- **Outbound (Driven):** Implements `ChannelDeliveryPort.send_message(payload: OutboundMessage) -> DeliveryReceipt` |
-| **8. Security Boundaries** | - **Trust Zone:** Zone 0 (External Internet) $\rightarrow$ Zone 1 (Authenticated Ingress).<br/>- **Boundary Rule:** Unwhitelisted Telegram User IDs are dropped at line 1 of the handler; zero system metadata, error stack traces, or bot status details are ever returned to non-owners. |
+| **8. Security Boundaries** | - **Trust Zone:** Zone 0 (External Internet) $\rightarrow$ Zone 1 (Authenticated Ingress).<br/>- **Boundary Rule:** Unwhitelisted Telegram User IDs and non-private chats (`group`, `supergroup`, `channel`) are dropped at line 1 of the handler; zero system metadata, error stack traces, or bot status details are ever returned to non-owners. Unix socket is protected with `chmod 0600`. |
 | **9. Error Handling** | - **Telegram Network Drop / `HTTP 502/504`:** Automatic long-polling reconnection with exponential backoff (`1s` to `30s`) without crashing the process.<br/>- **Telegram Rate Limit (`HTTP 429 RetryAfter`):** Sleeps for the exact `retry_after` duration specified by Telegram.<br/>- **Malformed Update Payload:** Logged as warning with `trace_id` and safely skipped so the polling offset advances cleanly. |
-| **10. Testing Requirements** | - **Unit Tests:** Test `OwnerAuthGuard` with whitelisted ID (passes) vs. non-whitelisted IDs, empty IDs, and spoofed group chats (all blocked and logged).<br/>- **Integration Tests:** Simulate `/status`, `/tasks`, `/notes`, and `/cancel` commands through both CLI and mocked Telegram polling loops (`GATE-MVP-02`, `GATE-MVP-03`). |
+| **10. Testing Requirements** | - **Unit Tests:** Test `OwnerAuthGuard` with whitelisted ID (passes) vs. non-whitelisted IDs, group chats, empty IDs, and spoofed forwards (all blocked and logged).<br/>- **Integration Tests:** Test cross-process cancellation over `data/aira.sock` and verify `/status`, `/tasks`, `/notes`, and `/cancel` commands through both CLI and mocked Telegram polling loops (`GATE-MVP-02`, `GATE-MVP-03`). |
 
 ---
 
@@ -76,10 +82,10 @@ The following 10 components form the **Stage 1 Local AI Prototype**. Together, t
 | **1. Component Name** | **Aira Core Engine** (`src/aira/core/engine`) |
 | **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-CORE-001`, `FR-CORE-002`, `FR-AUTO-004` |
 | **2. Purpose** | Acts as the central executive brain of AIRA MOCHTAR, enforcing Aira's identity, critical-thinking behavioral rules, epistemic honesty, and coordinating the multi-step reasoning and tool-execution loop. |
-| **3. Responsibilities** | 1. Maintain and inject the canonical **Aira Mochtar Persona & Behavioral Specification** (warm, analytical, critical thinker, anti-sycophancy, assumption challenger, explicit uncertainty disclosure, non-sentience boundary).<br/>2. Orchestrate the turn lifecycle: Context Assembly (`CMP-04`) $\rightarrow$ LLM Inference (`CMP-05`) $\rightarrow$ Permission Check (`CMP-08`) $\rightarrow$ Tool Execution (`CMP-07`) $\rightarrow$ Final Synthesis $\rightarrow$ Memory Persistence (`CMP-06`).<br/>3. Enforce a hard maximum tool-call loop ceiling per turn (`MAX_TOOL_ITERATIONS = 5` in Stage 1) to prevent infinite reasoning loops.<br/>4. Register active turns in an in-memory `ActiveTurnRegistry` bound to cancellation tokens so `/cancel` (`FR-AUTO-004`) halts execution within 3 seconds. |
+| **3. Responsibilities** | 1. Maintain and inject the canonical **Aira Mochtar Persona & Behavioral Specification** (warm, analytical, critical thinker, anti-sycophancy, assumption challenger, explicit uncertainty disclosure, non-sentience boundary).<br/>2. Orchestrate the turn lifecycle: Context Assembly (`CMP-04`) $\rightarrow$ LLM Inference (`CMP-05`) $\rightarrow$ Permission Check (`CMP-08`) $\rightarrow$ Tool Execution (`CMP-07`) $\rightarrow$ Final Synthesis $\rightarrow$ Memory Persistence (`CMP-06`).<br/>3. Enforce a hard maximum tool-call loop ceiling per turn (`MAX_TOOL_ITERATIONS = 5` in Stage 1) to prevent infinite reasoning loops.<br/>4. Manage the **Dual-Channel Cancellation Model (`ISS-02`, `ADR-008`)**: Maintain an in-memory `ActiveTurnRegistry` mapping active turns to cooperative `CancelToken` (`asyncio.Event`) instances, responding to in-process Telegram `/cancel` and cross-process CLI cancellations via `data/aira.sock`, persisting cancellation signals in SQLite `cancellation_signals`, and cleanly aborting external network sockets via `asyncio.wait_for`. |
 | **4. Inputs** | - `InboundUserRequest` or `CancellationSignal` from `CMP-02` (or `SystemTrigger` from `CMP-11` in Stage 2).<br/>- `AssembledContext` from `CMP-04`.<br/>- `LLMResponse` from `CMP-05` and `ToolExecutionResult` from `CMP-07`. |
 | **5. Outputs** | - `TurnResponse(trace_id, final_text, citations, tool_calls_summary, token_usage, status)` passed to `CMP-10` (`Notification Service`).<br/>- Session turn records committed to `CMP-06` (`Persistent Memory`).<br/>- Turn lifecycle audit events committed to `CMP-09` (`Audit Logger`). |
-| **6. Dependencies** | - **Internal Ports Only:** `ContextAssemblerPort` (`CMP-04`), `LLMProviderPort` (`CMP-05`), `MemoryStorePort` (`CMP-06`), `ToolExecutionPort` (`CMP-07`), `PermissionEnginePort` (`CMP-08`), `AuditLoggerPort` (`CMP-09`), `NotificationPort` (`CMP-10`).<br/>- **External:** None (100% pure domain/application logic). |
+| **6. Dependencies** | - **Internal:** `ContextManager` (`CMP-04`), `PermissionEngine` (`CMP-08`), `AuditLogger` (`CMP-09`), `NotificationHelper` (`CMP-10`), and concrete repositories via `MemoryStorePort` (`CMP-06`).<br/>- **External Ports:** `LLMProviderPort` (`CMP-05`), `ToolAdapterPort` (`CMP-07`).<br/>- **External Libraries:** None (100% pure domain/application logic). |
 | **7. Interfaces** | - Implements `InboundRequestPort`:<br/>  - `async handle_user_request(request: InboundUserRequest) -> TurnResponse`<br/>  - `async handle_cancel(signal: CancellationSignal) -> CancelResult` |
 | **8. Security Boundaries** | - **Trust Zone:** Zone 2 (Trusted Core).<br/>- **Boundary Rule:** `Aira Core Engine` cannot execute any tool directly; it must pass every LLM-proposed `ToolCall` through `PermissionEnginePort.evaluate()` (`CMP-08`) before calling `ToolExecutionPort.execute()` (`CMP-07`). |
 | **9. Error Handling** | - **`asyncio.CancelledError` (`/cancel` invoked):** Catches cancellation cleanly, marks the turn `CANCELLED_BY_USER` in `CMP-06`/`CMP-09`, and returns an immediate cancellation confirmation.<br/>- **`MaxIterationsExceededError`:** Stops tool looping after 5 iterations, synthesizes partial findings, and informs the user.<br/>- **Unhandled Downstream Exceptions:** Caught at the top-level turn boundary, logged with full stack trace and `trace_id` to `CMP-09`, and converted into a safe, user-friendly diagnostic message. |
@@ -94,11 +100,11 @@ The following 10 components form the **Stage 1 Local AI Prototype**. Together, t
 | **1. Component Name** | **Context Manager** (`src/aira/core/context`) |
 | **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-CORE-003`, `SEC-003`, `NFR-001` |
 | **2. Purpose** | Assembles a deterministic, token-budgeted, and security-delimited prompt payload before every LLM invocation so Aira's reasoning is grounded in accurate time, user preferences, active tasks, and relevant notes. |
-| **3. Responsibilities** | 1. Inject authoritative system clock metadata (`ISO-8601` timestamp, day of week, `Asia/Jakarta` timezone).<br/>2. Query `CMP-06` (`Persistent Memory`) for structured user preferences, recent session history, active high-priority tasks, and keyword-relevant notes.<br/>3. Enforce strict token budgeting across prompt sections so total input never exceeds `MAX_INPUT_TOKENS_PER_TURN`.<br/>4. Wrap any external or third-party text in `<untrusted_external_data>` XML delimiters and set the `is_tainted` flag on the context object (`SEC-003`). |
+| **3. Responsibilities** | 1. Inject authoritative system clock metadata (`ISO-8601` timestamp, day of week, `Asia/Jakarta` timezone).<br/>2. Query `CMP-06` (`Persistent Memory`) for structured user preferences, recent session history, active high-priority tasks, and keyword-relevant notes.<br/>3. Enforce strict token budgeting across prompt sections using a fast local estimation heuristic ($\lceil \text{bytes} / 3.5 \rceil$, `< 1 ms`) so total input never exceeds `MAX_INPUT_TOKENS_PER_TURN` while satisfying the $< 300\text{ ms}$ assembly SLA budget (`NFR-001`, `ISS-09`).<br/>4. Wrap any external or third-party text in `<untrusted_external_data>` XML delimiters and set `source_trust: "external_derived"` and `is_tainted = True` on the context object (`SEC-003`, `ISS-05`). |
 | **4. Inputs** | - `InboundUserRequest` (user query, channel metadata, `trace_id`).<br/>- Retrieved records from `CMP-06` (`UserPreferences`, `SessionMessage[]`, `Task[]`, `KnowledgeNote[]`).<br/>- Token budget configuration from `CMP-01`. |
 | **5. Outputs** | - `AssembledContext(trace_id, system_instruction, messages, authorized_tool_declarations, token_estimate, is_tainted, retrieved_source_ids)`. |
-| **6. Dependencies** | - **Internal:** `MemoryStorePort` (`CMP-06`), `ToolRegistryPort` (`CMP-07`), `AppConfig` (`CMP-01`).<br/>- **External:** Standard library `datetime`/`zoneinfo`. |
-| **7. Interfaces** | - Implements `ContextAssemblerPort`:<br/>  - `async assemble_context(request: InboundUserRequest, domain_scope: str) -> AssembledContext` |
+| **6. Dependencies** | - **Internal:** `MemoryStorePort` (`CMP-06`), `ToolAdapterPort` (`CMP-07`), `AppConfig` (`CMP-01`).<br/>- **External:** Standard library `datetime`/`zoneinfo`. |
+| **7. Interfaces** | - Concrete Class `ContextManager`:<br/>  - `async assemble_context(request: InboundUserRequest, domain_scope: str) -> AssembledContext` |
 | **8. Security Boundaries** | - **Trust Zone:** Zone 2 (Trusted Core).<br/>- **Boundary Rule:** Sanitizes external inputs by stripping any attempt to close `</untrusted_external_data>` tags prematurely (preventing XML delimiter escape attacks). |
 | **9. Error Handling** | - **Token Budget Overflow:** Deterministically trims oldest session messages first, then lowest-ranked retrieved notes, while preserving System Persona, User Preferences, and the current user message.<br/>- **Memory Query Timeout (> 300 ms):** Logs latency warning and proceeds with base persona + current message rather than failing the turn. |
 | **10. Testing Requirements** | - **Unit Tests:** Verify timestamp injection, deterministic token trimming order, and XML delimiter escaping on malicious input strings containing `</untrusted_external_data>`.<br/>- **Performance Tests (`NFR-001`):** Verify context assembly completes in $< 300\text{ ms}$ at p95. |
@@ -130,32 +136,32 @@ The following 10 components form the **Stage 1 Local AI Prototype**. Together, t
 | **1. Component Name** | **Persistent Memory Store** (`src/aira/memory`) |
 | **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-PERS-001`, `FR-PERS-002`, `SYS-002` |
 | **2. Purpose** | Provides durable, ACID-compliant local storage and fast full-text retrieval for conversational sessions, personal tasks, knowledge notes, user preferences, and HITL approval states. |
-| **3. Responsibilities** | 1. Manage the local SQLite 3 database connection pool with `WAL` mode, `foreign_keys = ON`, and `busy_timeout = 5000` enforced on every connection.<br/>2. Execute versioned, idempotent SQL schema migrations at startup.<br/>3. Provide repository operations for:<br/>   - `SessionRepository`: Append and fetch conversation turns.<br/>   - `TaskRepository`: CRUD and status/priority/deadline filtering for tasks (`FR-PERS-001`).<br/>   - `NoteRepository`: CRUD and **SQLite FTS5 (BM25)** keyword search over personal notes and ingested Markdown files (`FR-PERS-002`).<br/>   - `PreferenceRepository`: Upsert and load structured user preferences. |
-| **4. Inputs** | - Typed domain entities (`TaskCreate`, `TaskUpdate`, `NoteCreate`, `SessionMessage`, `PreferenceEntry`) and search queries (`SearchFilter`). |
-| **5. Outputs** | - Hydrated domain models (`Task`, `KnowledgeNote`, `SessionMessage`, `UserPreference`) with database IDs, timestamps, and FTS5 relevance scores. |
-| **6. Dependencies** | - **Internal:** `CMP-01` (`DATABASE_URL`), `CMP-09` (`Audit Logger`).<br/>- **External:** SQLite 3 (`aiosqlite` / standard `sqlite3` with FTS5 extension enabled). |
-| **7. Interfaces** | - Implements `MemoryStorePort`:<br/>  - `Tasks`: `create_task()`, `update_task()`, `list_tasks()`, `get_task_by_id()`<br/>  - `Notes`: `save_note()`, `search_notes_fts()`, `get_note_by_id()`, `archive_note()`<br/>  - `Sessions`: `append_turn()`, `get_recent_turns()`<br/>  - `Preferences`: `set_preference()`, `get_all_preferences()` |
+| **3. Responsibilities** | 1. Manage the local SQLite 3 database connection pool with `WAL` mode, `foreign_keys = ON`, and `busy_timeout = 5000` enforced on every connection.<br/>2. Execute versioned, idempotent SQL schema migrations at startup.<br/>3. Provide repository operations for:<br/>   - `SessionRepository`: Append and fetch conversation turns.<br/>   - `TaskRepository`: CRUD and status/priority/deadline filtering for tasks (`FR-PERS-001`).<br/>   - `NoteRepository`: CRUD and **SQLite FTS5 (BM25)** keyword search over personal notes and ingested Markdown files (`FR-PERS-002`).<br/>   - `PreferenceRepository`: Upsert and load structured user preferences.<br/>   - `ProjectService` (`FR-BIZ-001`, Stage 2): Manage business projects, milestones, and deliverable dependencies (`ISS-04`).<br/>   - `DocumentService` (`FR-BIZ-002`, Stage 2): Manage SOP templates and generated business documents (`ISS-04`).<br/>   - `MessageDraftService` (`FR-COMM-003`, Stage 2): Manage staged outbound message drafts pending HITL approval (`ISS-04`).<br/>4. Maintain storage portability (`ISS-06`, `ADR-005`): Encapsulate all SQL dialect specifics inside `SQLiteMemoryStore` (Stage 1) and `PostgresMemoryStore` (Stage 2+), enabling data migration via `aira db migrate-to-pg`. |
+| **4. Inputs** | - Typed domain entities (`TaskCreate`, `TaskUpdate`, `NoteCreate`, `SessionMessage`, `PreferenceEntry`, `ProjectCreate`, `DocumentCreate`, `MessageDraftCreate`) and search queries (`SearchFilter`). |
+| **5. Outputs** | - Hydrated domain models (`Task`, `KnowledgeNote`, `SessionMessage`, `UserPreference`, `Project`, `BusinessDocument`, `MessageDraft`) with database IDs, timestamps, and FTS5 relevance scores. |
+| **6. Dependencies** | - **Internal:** `CMP-01` (`DATABASE_URL`), `CMP-09` (`Audit Logger`).<br/>- **External:** SQLite 3 (`aiosqlite` / standard `sqlite3` with FTS5 extension enabled in Stage 1; `asyncpg` in Stage 2+). |
+| **7. Interfaces** | - Implements `MemoryStorePort`:<br/>  - `Tasks`: `create_task()`, `update_task()`, `list_tasks()`, `get_task_by_id()`<br/>  - `Notes`: `save_note()`, `search_notes_fts()`, `get_note_by_id()`, `archive_note()`<br/>  - `Sessions`: `append_turn()`, `get_recent_turns()`<br/>  - `Preferences`: `set_preference()`, `get_all_preferences()`<br/>  - `Projects` (Stage 2): `create_project()`, `update_milestone()`, `get_project_summary()`<br/>  - `Documents` (Stage 2): `render_sop()`, `archive_document()`<br/>  - `MessageDrafts` (Stage 2): `create_draft()`, `approve_draft()`, `list_pending_drafts()` |
 | **8. Security Boundaries** | - **Trust Zone:** Zone 3 (Restricted Kernel).<br/>- **Boundary Rule:** All SQL queries use 100% parameterized prepared statements (`?` / `:param`)—string concatenation in SQL is strictly prohibited to prevent SQL injection. Database file is created with `0600` owner-only permissions. |
 | **9. Error Handling** | - **`DatabaseLockedError` (`SQLITE_BUSY`):** Mitigated by `WAL` mode and `5000ms` busy timeout; retries transaction up to 3 times before raising `StorageUnavailableError`.<br/>- **`MigrationFailureError`:** Rolls back failed migration transaction and aborts startup to prevent schema corruption. |
 | **10. Testing Requirements** | - **Unit & Integration Tests (`GATE-MVP-03`):** Test all CRUD methods, FTS5 ranking accuracy, concurrent read/write safety under `WAL` mode, and persistence across simulated process restarts. |
 
 ---
 
-### `CMP-07`: Integration Manager & Local Tool Bus
+### `CMP-07`: Integration Manager & Tool Adapter
 
 | Attribute | Specification |
 | :--- | :--- |
-| **1. Component Name** | **Integration Manager & Tool Execution Bus** (`src/aira/integrations`) |
-| **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-AUTO-001`, `NFR-002`, `NFR-003` |
+| **1. Component Name** | **Integration Manager & Tool Adapter** (`src/aira/integrations`) |
+| **Stage & Priority** | Stage 1 MVP (`P0`) — Linked to `FR-AUTO-001`, `NFR-002`, `NFR-003`, `ISS-03` |
 | **2. Purpose** | Acts as the central registry, JSON Schema validator, timeout isolator, and deterministic execution bus for all tools invoked by Aira. |
-| **3. Responsibilities** | 1. Register every available tool with a unique name, description, strict Pydantic/JSON Schema input contract, execution timeout, and mandatory `PermissionTier` (`Tier A`–`Tier D`).<br/>2. Validate raw LLM tool arguments against the tool's schema before execution.<br/>3. Execute Stage 1 built-in deterministic tools: `create_task`, `list_tasks`, `complete_task`, `save_note`, `search_notes`, `set_user_preference`, `get_system_status`, and deterministic date/math calculators (`NFR-002`).<br/>4. Enforce per-tool execution timeouts and strip any environment secrets from tool outputs before returning results to `Aira Core Engine`. |
-| **4. Inputs** | - `VerifiedToolInvocation(trace_id, tool_name, raw_arguments, approval_token_or_tier_status)` from `CMP-03` after passing `CMP-08` (`Permission Engine`). |
+| **3. Responsibilities** | 1. Register every available tool with a unique name, description, strict Pydantic/JSON Schema input contract, execution timeout, and mandatory `PermissionTier` (`Tier A`–`Tier D`).<br/>2. Validate raw LLM tool arguments against the tool's schema before execution.<br/>3. Execute Stage 1 built-in deterministic tools: `create_task`, `list_tasks`, `complete_task`, `save_note`, `search_notes`, `set_user_preference`, `get_system_status`, and deterministic date/math calculators (`NFR-002`).<br/>4. **Enforce Canonical Policy Flow (`ISS-03`):** Refuse execution unless called with an authentic `PolicyClearance` token from `CMP-08`. Dispatch tool execution records to `CMP-09` (`Audit Logger`).<br/>5. Enforce per-tool execution timeouts and strip any environment secrets from tool outputs before returning results to `Aira Core Engine`. |
+| **4. Inputs** | - `VerifiedToolInvocation(trace_id, tool_name, raw_arguments, clearance: PolicyClearance)` from `CMP-03` after passing `CMP-08` (`Permission Engine`). |
 | **5. Outputs** | - `ToolExecutionResult(trace_id, tool_name, status, structured_output, error_message, execution_ms, is_external_untrusted)`. |
-| **6. Dependencies** | - **Internal:** `CMP-06` (`MemoryStorePort`), `CMP-08` (`PermissionEnginePort`), `CMP-09` (`AuditLoggerPort`).<br/>- **External:** `pydantic` for schema validation. |
-| **7. Interfaces** | - Implements `ToolRegistryPort`: `get_tool_declarations(domain_scope: str) -> list[ToolSchema]`<br/>- Implements `ToolExecutionPort`: `async execute_tool(invocation: VerifiedToolInvocation) -> ToolExecutionResult` |
-| **8. Security Boundaries** | - **Trust Zone:** Zone 2 (Core) $\leftrightarrow$ Zone 1 (Adapters).<br/>- **Boundary Rule:** `execute_tool()` refuses to run any tool unless the passed invocation carries a valid `PolicyClearance` object issued by `CMP-08` (`Permission Engine`). |
+| **6. Dependencies** | - **Internal:** `CMP-06` (`MemoryStorePort`), `CMP-08` (`PermissionEngine`), `CMP-09` (`AuditLogger`).<br/>- **External:** `pydantic` for schema validation. |
+| **7. Interfaces** | - Implements `ToolAdapterPort` (Principal External Port):<br/>  - `get_tool_declarations(domain_scope: str) -> list[ToolSchema]`<br/>  - `async execute_tool(invocation: VerifiedToolInvocation) -> ToolExecutionResult` |
+| **8. Security Boundaries** | - **Trust Zone:** Zone 2 (Core) $\leftrightarrow$ Zone 1 (Adapters).<br/>- **Boundary Rule:** `execute_tool()` strictly asserts `invocation.clearance.is_valid()`. Invocations without a clearance token are rejected immediately without execution. |
 | **9. Error Handling** | - **`ToolValidationError`:** If the LLM supplies invalid argument types or missing required fields, returns a structured validation error back to the LLM so it can self-correct on the next step.<br/>- **`ToolTimeoutError` (`NFR-003`):** Cancels tool execution exceeding its timeout (default `10s` local, `15s` external) and returns a safe timeout status without crashing the runtime. |
-| **10. Testing Requirements** | - **Unit Tests:** Test schema validation rejection on malformed LLM arguments, timeout isolation on a hanging mock tool, and deterministic accuracy of math/date utilities (`NFR-002`). |
+| **10. Testing Requirements** | - **Unit Tests:** Test schema validation rejection on malformed LLM arguments, clearance token verification, timeout isolation on a hanging mock tool, and deterministic accuracy of math/date utilities (`NFR-002`). |
 
 ---
 
@@ -164,16 +170,16 @@ The following 10 components form the **Stage 1 Local AI Prototype**. Together, t
 | Attribute | Specification |
 | :--- | :--- |
 | **1. Component Name** | **Permission Engine & Approval Gateway** (`src/aira/security/permissions`) |
-| **Stage & Priority** | Stage 1 MVP (`P0`) / Stage 2 Interactive Telegram HITL (`P1`) — Linked to `PERM-001`–`004`, `SEC-003` |
+| **Stage & Priority** | Stage 1 MVP (`P0`) / Stage 2 Interactive Telegram HITL (`P1`) — Linked to `PERM-001`–`004`, `SEC-003`, `ISS-03`, `ISS-05` |
 | **2. Purpose** | Enforces deterministic security governance over every action Aira attempts to take, guaranteeing that high-risk actions pause for human approval and prohibited actions are permanently blocked. |
-| **3. Responsibilities** | 1. Classify every tool call into one of the four mandatory tiers (`PERM-001`):<br/>   - `Tier A (READ_ONLY)`: Auto-approve.<br/>   - `Tier B (LOCAL_WRITE_REVERSIBLE)`: Auto-approve + audit log (unless turn is marked `is_tainted` by external untrusted input, which escalates `Tier B` $\rightarrow$ `Tier C`).<br/>   - `Tier C (CONSEQUENTIAL_HITL)`: Halt execution, compute `SHA256(canonical_json(tool_name, args))`, store a `PendingApproval` record with expiration TTL, and request human confirmation.<br/>   - `Tier D (PROHIBITED_GUARDRAIL)`: Hard-block unconditionally.<br/>2. Verify single-use approval tokens (`approval_id`, owner ID, TTL expiration, and exact SHA-256 payload match) when the user approves a pending `Tier C` action (`PERM-002`). |
-| **4. Inputs** | - `PolicyEvaluationRequest(trace_id, actor, tool_name, arguments, is_context_tainted, approval_token)`.<br/>- User approval/rejection callbacks (`HITLDecisionCallback`) from `CMP-02`. |
-| **5. Outputs** | - `PolicyDecision`: One of `PolicyClearance(APPROVED)`, `ApprovalRequiredChallenge(approval_id, payload_hash, summary, expires_at)`, or `PolicyViolationError(DENIED)`. |
-| **6. Dependencies** | - **Internal:** `CMP-06` (`MemoryStorePort` for persisting `pending_approvals`), `CMP-09` (`AuditLoggerPort`).<br/>- **External:** Python standard library `hashlib` (`sha256`), `hmac`, `json`. |
-| **7. Interfaces** | - Implements `PermissionEnginePort`:<br/>  - `async evaluate(request: PolicyEvaluationRequest) -> PolicyDecision`<br/>  - `async resolve_approval(callback: HITLDecisionCallback) -> ApprovalResolution` |
+| **3. Responsibilities** | 1. Classify every tool call into one of the four mandatory tiers (`PERM-001`):<br/>   - `Tier A (READ_ONLY)`: Auto-approve.<br/>   - `Tier B (LOCAL_WRITE_REVERSIBLE)`: Auto-approve + audit log.<br/>   - `Tier C (CONSEQUENTIAL_HITL)`: Halt execution, compute `SHA256(canonical_json(tool_name, args))`, store a `PendingApproval` record with expiration TTL, and request human confirmation.<br/>   - `Tier D (PROHIBITED_GUARDRAIL)`: Hard-block unconditionally.<br/>2. Apply **Sink-Aware Taint Policy (`ISS-05`)**: When context is tainted by external data, safe local sinks (`save_note`, `tag_task`) maintain `Tier B` (tagging records as `external_derived`), while control sinks (`set_user_preference`, schedule changes) escalate to `Tier C`.<br/>3. Issue unforgeable `PolicyClearance` tokens required by `CMP-07` for tool execution (`ISS-03`).<br/>4. Verify single-use approval tokens (`approval_id`, owner ID, TTL expiration, and exact SHA-256 payload match) when the user approves a pending `Tier C` action (`PERM-002`). |
+| **4. Inputs** | - `PolicyEvaluationRequest(trace_id, actor, tool_name, arguments, source_trust, is_context_tainted, approval_token)`.<br/>- User approval/rejection callbacks (`HITLDecisionCallback`) from `CMP-02`. |
+| **5. Outputs** | - `PolicyDecision`: One of `PolicyClearance(token, status=APPROVED)`, `ApprovalRequiredChallenge(approval_id, payload_hash, summary, expires_at)`, or `PolicyViolationError(DENIED)`. |
+| **6. Dependencies** | - **Internal:** `CMP-06` (`MemoryStorePort` for persisting `pending_approvals`), `CMP-09` (`AuditLogger`).<br/>- **External:** Python standard library `hashlib` (`sha256`), `hmac`, `json`. |
+| **7. Interfaces** | - Concrete Domain Module `PermissionEngine`:<br/>  - `async evaluate(request: PolicyEvaluationRequest) -> PolicyDecision`<br/>  - `async resolve_approval(callback: HITLDecisionCallback) -> ApprovalResolution` |
 | **8. Security Boundaries** | - **Trust Zone:** Zone 3 (Restricted Kernel).<br/>- **Boundary Rule:** Unregistered tools default to `Tier C`. `Tier D` rules are hardcoded in immutable Python constants that cannot be modified via database settings or LLM prompts (`Section 6.5 Hard Guardrails`). |
 | **9. Error Handling** | - **`ApprovalExpiredError`:** Rejects approval callbacks after TTL (default 24h) and marks the record `EXPIRED`.<br/>- **`PayloadTamperedError`:** If the payload hash at execution time differs by even 1 bit from the approved SHA-256 hash, blocks execution and logs a `CRITICAL` security alert.<br/>- **`PolicyViolationError`:** Raised immediately on any `Tier D` attempt. |
-| **10. Testing Requirements** | - **Security & Governance Tests (`GATE-MVP-02`, `GATE-STG2-02`):** Test all 4 tiers, taint escalation (`Tier B` $\rightarrow$ `Tier C` when untrusted data is present), expired token rejection, and SHA-256 payload modification rejection. |
+| **10. Testing Requirements** | - **Security & Governance Tests (`GATE-MVP-02`, `GATE-STG2-02`):** Test all 4 tiers, sink-aware taint policy (`save_note` stays Tier B, `set_user_preference` escalates to Tier C), expired token rejection, and SHA-256 payload modification rejection. |
 
 ---
 
@@ -188,26 +194,26 @@ The following 10 components form the **Stage 1 Local AI Prototype**. Together, t
 | **4. Inputs** | - `AuditEvent(trace_id, actor, action_type, tool_name, permission_tier, approval_status, outcome, metadata)` from any component.<br/>- Literal secret patterns from `CMP-01`. |
 | **5. Outputs** | - Sanitized append-only rows in the `audit_logs` database table.<br/>- Sanitized JSON lines in `data/logs/aira.jsonl`. |
 | **6. Dependencies** | - **Internal:** `CMP-01` (Secret patterns), `CMP-06` (Append-only DB connection).<br/>- **External:** Python `logging`, `re`, `json`. |
-| **7. Interfaces** | - Implements `AuditLoggerPort`:<br/>  - `async log_event(event: AuditEvent) -> None`<br/>  - `sanitize_text(raw_text: str) -> str` |
-| **8. Security Boundaries** | - **Trust Zone:** Zone 3 (Restricted Kernel).<br/>- **Boundary Rule:** The `AuditLoggerPort` exposes **zero** `update_audit_log()` or `delete_audit_log()` methods. Furthermore, a SQLite `BEFORE UPDATE` and `BEFORE DELETE` trigger on `audit_logs` raises `RAISE(ABORT, 'Audit logs are append-only')` at the database engine level. |
+| **7. Interfaces** | - Concrete Domain Module `AuditLogger`:<br/>  - `async log_event(event: AuditEvent) -> None`<br/>  - `sanitize_text(raw_text: str) -> str` |
+| **8. Security Boundaries** | - **Trust Zone:** Zone 3 (Restricted Kernel).<br/>- **Boundary Rule:** Exposes **zero** `update_audit_log()` or `delete_audit_log()` methods. A SQLite `BEFORE UPDATE` and `BEFORE DELETE` trigger on `audit_logs` raises `RAISE(ABORT, 'Audit logs are append-only')` at the database engine level. |
 | **9. Error Handling** | - **Disk Full / DB Write Failure:** Falls back to writing emergency audit records to `stderr` and raises a critical system health alert so silent unlogged execution never occurs. |
 | **10. Testing Requirements** | - **Security Tests (`SEC-001`, `SEC-004`):** Inject real-looking API keys into simulated error traces and verify 100% redaction in both `aira.jsonl` and `audit_logs`; attempt `DELETE FROM audit_logs` and verify that the SQLite trigger aborts the deletion. |
 
 ---
 
-### `CMP-10`: Notification Service
+### `CMP-10`: Notification Helper & Service
 
 | Attribute | Specification |
 | :--- | :--- |
-| **1. Component Name** | **Notification Service & Channel Router** (`src/aira/communication/notifications`) |
-| **Stage & Priority** | Stage 1 MVP (`P0` Formatting & Routing) / Stage 2 (`P1` Quiet Hours & Urgency Deduplication) — Linked to `FR-COMM-001`, `FR-COMM-004` |
+| **1. Component Name** | **Notification Helper & Service** (`src/aira/communication/notifications`) |
+| **Stage & Priority** | Stage 1 MVP (`P0` Helper Module: Formatting & Paginating) / Stage 2 (`P1` Service: Quiet Hours & Urgency Deduplication) — Linked to `FR-COMM-001`, `FR-COMM-004`, `ISS-08` |
 | **2. Purpose** | Formats and routes all outbound messages, responses, approval prompts, and alerts to the appropriate user interface while protecting user attention through pagination, urgency filtering, and Quiet Hours. |
-| **3. Responsibilities** | 1. Format Markdown responses safely for the target channel (Telegram Markdown/HTML escaping vs. CLI Rich ANSI formatting).<br/>2. Automatically split responses exceeding Telegram's `4,096`-character limit at clean paragraph or code-block boundaries (`INT-002`).<br/>3. Attach inline approval keyboards (`[Approve]`, `[Reject]`) for `Tier C` HITL prompts.<br/>4. In Stage 2 (`FR-COMM-004`), evaluate notification urgency (`LOW`, `NORMAL`, `HIGH`, `CRITICAL`) against configured Quiet Hours and deduplicate repeated alerts within a cooldown window. |
+| **3. Responsibilities** | 1. **Stage 1 Helper Module (`ISS-08`):** Concrete stateless `NotificationHelper` that formats Markdown responses safely for the target channel (Telegram Markdown/HTML escaping vs. CLI Rich ANSI formatting) and paginates responses exceeding `4,096` characters.<br/>2. Render inline approval keyboards (`[Approve]`, `[Reject]`) for `Tier C` HITL prompts.<br/>3. **Stage 2 Expansion:** Stateful `NotificationService` evaluating notification urgency (`LOW`, `NORMAL`, `HIGH`, `CRITICAL`) against configured Quiet Hours and deduplicating repeated alerts within a cooldown window (`FR-COMM-004`). |
 | **4. Inputs** | - `OutboundNotification(trace_id, target_channel, urgency, title, body_markdown, inline_buttons, dedupe_key)`. |
 | **5. Outputs** | - Channel-formatted payloads delivered via `ChannelDeliveryPort` (`CMP-02`).<br/>- Queued overnight notifications stored in `CMP-06` when suppressed by Quiet Hours (Stage 2). |
-| **6. Dependencies** | - **Internal:** `ChannelDeliveryPort` (`CMP-02`), `MemoryStorePort` (`CMP-06`), `AuditLoggerPort` (`CMP-09`).<br/>- **External:** None. |
-| **7. Interfaces** | - Implements `NotificationPort`:<br/>  - `async notify_owner(notification: OutboundNotification) -> DeliveryStatus` |
-| **8. Security Boundaries** | - **Trust Zone:** Zone 2 (Core) $\rightarrow$ Zone 1 (Egress Adapter).<br/>- **Boundary Rule:** Passes all outbound text through `AuditLoggerPort.sanitize_text()` (`CMP-09`) as a final defense-in-depth gate before transmitting over Telegram/CLI. |
+| **6. Dependencies** | - **Internal:** `ChannelDeliveryPort` (`CMP-02`), `MemoryStorePort` (`CMP-06`), `AuditLogger` (`CMP-09`).<br/>- **External:** None. |
+| **7. Interfaces** | - Concrete Class `NotificationHelper` (Stage 1) / `NotificationService` (Stage 2):<br/>  - `format_and_deliver(notification: OutboundNotification, delivery_port: ChannelDeliveryPort) -> DeliveryStatus` |
+| **8. Security Boundaries** | - **Trust Zone:** Zone 2 (Core) $\rightarrow$ Zone 1 (Egress Adapter).<br/>- **Boundary Rule:** Passes all outbound text through `AuditLogger.sanitize_text()` (`CMP-09`) as a final defense-in-depth gate before transmitting over Telegram/CLI. |
 | **9. Error Handling** | - **Telegram Markdown Parse Error (`HTTP 400 can't parse entities`):** Automatically strips broken Markdown formatting and retries sending as plain text so the user never misses a response.<br/>- **Message Exceeds 4,096 Characters:** Deterministically chunks into numbered parts (`[1/3]`, `[2/3]`, `[3/3]`). |
 | **10. Testing Requirements** | - **Unit Tests:** Test 10,000-character Markdown pagination (preserving fenced code blocks), fallback to plain text on malformed Markdown, Quiet Hours queuing for `NORMAL` alerts vs. immediate bypass for `CRITICAL` alerts. |
 
@@ -358,12 +364,12 @@ The table below defines the exact runtime interaction contracts between componen
 | **`INT-CMP-05`** | `CMP-03` Aira Core Engine | `CMP-04` Context Manager | `ContextAssemblerPort` | `InboundUserRequest` $\rightarrow$ `AssembledContext` | Async (`await`) | **Stage 1 (MVP)** |
 | **`INT-CMP-06`** | `CMP-04` Context Manager | `CMP-06` Persistent Memory | `MemoryStorePort` | `SearchFilter` $\rightarrow$ `Prefs + Turns + Tasks + Notes` | Async (`await`) | **Stage 1 (MVP)** |
 | **`INT-CMP-07`** | `CMP-03` Aira Core Engine | `CMP-05` AI Provider | `LLMProviderPort` | `AssembledContext` $\rightarrow$ `LLMResponse` | Async (`await`) | **Stage 1 (MVP)** |
-| **`INT-CMP-08`** | `CMP-03` Aira Core Engine | `CMP-08` Permission Engine | `PermissionEnginePort` | `PolicyEvaluationRequest` $\rightarrow$ `PolicyDecision` | Async (`await`) | **Stage 1 (MVP)** |
-| **`INT-CMP-09`** | `CMP-03` Aira Core Engine | `CMP-07` Integration Mgr | `ToolExecutionPort` | `VerifiedToolInvocation` $\rightarrow$ `ToolExecutionResult` | Async (`await`) | **Stage 1 (MVP)** |
-| **`INT-CMP-10`** | `CMP-07` Integration Mgr | `CMP-06` Persistent Memory | `MemoryStorePort` | `Task/Note Mutation` $\rightarrow$ `PersistedEntity` | Async (ACID Tx) | **Stage 1 (MVP)** |
-| **`INT-CMP-11`** | `CMP-03` / `CMP-08` | `CMP-10` Notification Svc | `NotificationPort` | `OutboundNotification` $\rightarrow$ `DeliveryStatus` | Async (`await`) | **Stage 1 (MVP)** |
-| **`INT-CMP-12`** | `CMP-10` Notification Svc | `CMP-02` Ingress (CLI/TG) | `ChannelDeliveryPort` | `FormattedMessage` $\rightarrow$ `DeliveryReceipt` | Async (`await`) | **Stage 1 (MVP)** |
-| **`INT-CMP-13`** | All Components (`CMP-02`..`17`) | `CMP-09` Audit Logger | `AuditLoggerPort` | `AuditEvent` $\rightarrow$ `Redacted JSON + DB Row` | Async (Append-Only) | **Stage 1 (MVP)** |
+| **`INT-CMP-08`** | `CMP-03` Aira Core Engine | `CMP-08` Permission Engine | `PermissionEngine` | `PolicyEvaluationRequest` $\rightarrow$ `PolicyClearance / Challenge` | Async (`await`) | **Stage 1 (MVP)** |
+| **`INT-CMP-09`** | `CMP-03` Aira Core Engine | `CMP-07` Tool Adapter | `ToolAdapterPort` | `VerifiedToolInvocation(clearance)` $\rightarrow$ `ToolExecutionResult` | Async (`await`) | **Stage 1 (MVP)** |
+| **`INT-CMP-10`** | `CMP-07` Tool Adapter | `CMP-06` Persistent Memory | `MemoryStorePort` | `Task/Note Mutation` $\rightarrow$ `PersistedEntity` | Async (ACID Tx) | **Stage 1 (MVP)** |
+| **`INT-CMP-11`** | `CMP-03` / `CMP-08` | `CMP-10` Notification Helper | `NotificationHelper` | `OutboundNotification` $\rightarrow$ `DeliveryStatus` | Async (`await`) | **Stage 1 (MVP)** |
+| **`INT-CMP-12`** | `CMP-10` Notification Helper | `CMP-02` Ingress (CLI/TG) | `ChannelDeliveryPort` | `FormattedMessage` $\rightarrow$ `DeliveryReceipt` | Async (`await`) | **Stage 1 (MVP)** |
+| **`INT-CMP-13`** | All Components (`CMP-02`..`17`) | `CMP-09` Audit Logger | `AuditLogger` | `AuditEvent` $\rightarrow$ `Redacted JSON + DB Row` | Async (Append-Only) | **Stage 1 (MVP)** |
 | **`INT-CMP-14`** | `CMP-11` Workflow Engine | `CMP-03` Aira Core Engine | `InboundRequestPort` | `ScheduledSystemTrigger` $\rightarrow$ `BriefingOutput` | Async (Cron Job) | Stage 2 (`P1`) |
 | **`INT-CMP-15`** | `CMP-04` Context Manager | `CMP-12` Semantic Memory | `SemanticMemoryPort` | `HybridQuery` $\rightarrow$ `RRF MemoryChunk[]` | Async (`await`) | Stage 2 (`P1`) |
 | **`INT-CMP-16`** | `CMP-07` Integration Mgr | `CMP-13` Academic Module | `AcademicServicePort` | `ResearchQuery` $\rightarrow$ `Verified ScholarlyWork[]` | Async (HTTPS) | Stage 2 (`P1`) |
@@ -387,40 +393,44 @@ flowchart TB
     end
 
     subgraph CoreExecutiveLayer["Core Executive & Cognitive Layer"]
-        CMP03["CMP-03: Aira Core Engine<br/>(Persona, Turn Loop & Cancel Registry)"]
+        CMP03["CMP-03: Aira Core Engine<br/>(Persona, Turn Loop & ActiveTurnRegistry)"]
         CMP04["CMP-04: Context Manager<br/>(Clock, Token Budget & XML Delimiters)"]
-        CMP10["CMP-10: Notification Service<br/>(Formatter & 4096-Char Paginator)"]
+        CMP10["CMP-10: Notification Helper<br/>(Markdown Formatter & 4096-Char Paginator)"]
     end
 
     subgraph GovernanceLayer["Security & Governance Layer"]
-        CMP08["CMP-08: Permission Engine<br/>(4-Tier Policy & SHA-256 HITL Gate)"]
+        CMP08["CMP-08: Permission Engine<br/>(4-Tier Policy, Sink-Aware Taint & SHA-256 HITL)"]
         CMP09["CMP-09: Audit Logger<br/>(Secret Redactor & Append-Only Log)"]
     end
 
     subgraph DrivenExecutionLayer["Driven Execution & Storage Layer"]
-        CMP05["CMP-05: AI Reasoning Provider<br/>(Gemini API Adapter & Token Ledger)"]
-        CMP07["CMP-07: Integration Manager<br/>(Schema Validator & Local Tool Bus)"]
-        CMP06["CMP-06: Persistent Memory Store<br/>(SQLite WAL + FTS5 Repositories)"]
+        CMP05["CMP-05: AI Reasoning Provider<br/>(LLMProviderPort / Gemini API Adapter)"]
+        CMP07["CMP-07: Integration Manager & Tool Adapter<br/>(ToolAdapterPort & Local Tool Bus)"]
+        CMP06["CMP-06: Persistent Memory Store<br/>(MemoryStorePort / SQLite WAL+FTS5)"]
         CMP01["CMP-01: Config & Secret Manager<br/>(Env Validator & Secret Vault)"]
     end
 
-    CMP02 -->|"InboundRequestPort"| CMP03
-    CMP03 -->|"ContextAssemblerPort"| CMP04
+    CMP02 -->|"Inbound Request / Cancel"| CMP03
+    CMP03 -->|"Context Assembly"| CMP04
     CMP04 -->|"MemoryStorePort"| CMP06
     CMP03 -->|"LLMProviderPort"| CMP05
-    CMP03 -->|"PermissionEnginePort"| CMP08
-    CMP03 -->|"ToolExecutionPort"| CMP07
+
+    %% Canonical Policy Flow (ISS-03)
+    CMP03 -->|"evaluate_tool_call()"| CMP08
+    CMP08 -->|"PolicyClearance (Tier A/B)"| CMP07
+    CMP08 -->|"Tier C Pause for Approval"| CMP10
     CMP07 -->|"MemoryStorePort"| CMP06
-    CMP08 -->|"MemoryStorePort"| CMP06
-    CMP03 -->|"NotificationPort"| CMP10
-    CMP08 -->|"NotificationPort"| CMP10
+    CMP07 -->|"External Tool I/O"| ExtTools["External APIs / Tools"]
+
+    CMP03 -->|"Format & Route"| CMP10
     CMP10 -->|"ChannelDeliveryPort"| CMP02
 
-    CMP02 -.->|"AuditLoggerPort"| CMP09
-    CMP03 -.->|"AuditLoggerPort"| CMP09
-    CMP05 -.->|"AuditLoggerPort"| CMP09
-    CMP07 -.->|"AuditLoggerPort"| CMP09
-    CMP08 -.->|"AuditLoggerPort"| CMP09
+    CMP02 -.->|"Log Ingress"| CMP09
+    CMP03 -.->|"Log Turn Lifecycle"| CMP09
+    CMP05 -.->|"Log Token Usage"| CMP09
+    CMP07 -.->|"Log Tool Execution"| CMP09
+    CMP08 -.->|"Log Policy Decision"| CMP09
+    ExtTools -.->|"Log API Latency"| CMP09
     CMP09 -->|"Append-Only SQL"| CMP06
 
     CMP01 -.->|"Scoped Config / Secrets"| CMP02
